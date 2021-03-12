@@ -2,59 +2,87 @@
 #include "led_driver.h"
 #include "pins.h"
 
-uint8_t active_color[3] = {0x00, 0x00, 0x00};
-uint8_t active_flags[N_LED_BYTES];
+// This is a highly modified addressable RGB led driver; inspiration was taken
+// from the tinyNeoPixel library in Spence Konde's megaTinyCore project 
+// (https://github.com/SpenceKonde/megaTinyCore) which in turn borrows from the
+// Adafruit library (https://github.com/adafruit/Adafruit_NeoPixel). Both
+// require 3 bytes per LED, which would be 180 bytes for our 60 LED earring; the
+// ATtiny402 only has 256 bytes of RAM to begin with, so we need to reduce this.
+//
+// We don't need to set colors for individual LEDs, just turn individual LEDs
+// "on" and "off" with a single RGB color; with 60 LEDs that requires just
+// 8 bytes for the bit flags (8*8=64>60) + 3 bytes for color = 11 bytes TOTAL.
+//
+// This is accomplished by replacing the "pointer to color byte" in the original
+// assembly with a "pointer to flag byte" - we can't have more than 1 of these
+// pointers apparently (no Y register?) so the color bytes are loaded into
+// registers instead. To get the timing right required breaking into smaller
+// subroutines.
 
+// RGB value to be sent to all active LEDs
+uint8_t active_color[3] = {0x10, 0x10, 0x10}; // Very low white
+// Bitwise flags indicating which LEDs are active
+static uint8_t active_flags[N_LED_BYTES];
+
+// On initialization, obtain the port register and pin mask
+// We do fast I/O on the pin by:
+//     READ   *port & pinMask
+//     SET    *port = *port | pinMask
+//     CLEAR  *port = *port & ~pinMask
 static volatile uint8_t *port;
 static uint8_t pinMask;
-
 void init_leds(void) {
+  pinMode(LED_PIN, OUTPUT);
   port    = portOutputRegister(digitalPinToPort(LED_PIN));
   pinMask = digitalPinToBitMask(LED_PIN);
+  clear_led_data();
 }
 
+// Running count of LEDs that have been set; used for safety purposes so that
+// no code can accidentally turn on too many LEDs and burn out the voltage
+// regulator.
+uint8_t active_led_count = 0xFF;
+
+// Turns all LEDs off; this happens every update cycle by default
 void clear_led_data(void) {
   memset(active_flags, 0, N_LED_BYTES);
+  active_led_count = 0;
 }
 
+// Enables a particular LED by setting its bit flag
 void set_led_active(uint8_t n) {
+  // Safety mechanism, only turn on the first MAX_LEDS_ON LEDs requested each cycle
+  if (active_led_count >= MAX_LEDS_ON) { return; }
+  active_led_count++;
   uint8_t byte = n / 8;
   uint8_t bit = 1 << (n & 0x07);
   active_flags[byte] |= bit;
 }
 
-// Safety feature - always check that at most this many LEDs are active
-#define MAX_LEDS_ON 8
-
-// *INDENT-OFF*   astyle don't like assembly
+// Sends LED RGB values based on active_color and active_flags
 void update_leds(void) {
-  uint8_t leds_on = 0;
-  for (uint8_t i = 0; i < N_LED_BYTES; i++) {
-    byte curr_flag = active_flags[i];
-    for (uint8_t b = 0; b < 8; b++) {
-      if (curr_flag & 0x80) leds_on++;
-      curr_flag <<= 1;
-    }
-  }
-  if (leds_on > MAX_LEDS_ON) return;
+  // Safety mechanism; in theory, this condition should never occur
+  if (active_led_count > MAX_LEDS_ON) { return; }
 
   noInterrupts(); // Need 100% focus on instruction timing
 
+  // Register definitions
   volatile uint8_t
-    led = N_LEDS,
-    rgb_flag = 1,
-    red = active_color[0],
-    green = active_color[1],
-    blue = active_color[2],
-    rgb_byte = red,
-    *ptr = active_flags,
-    active = *ptr++,
-    hi = *port |  pinMask,
-    lo = *port & ~pinMask,
-    next = lo,
-    bit = 8,
-    flag_bit = 8;
+    led = N_LEDS,            // Counts down from N_LEDS to 0
+    rgb_flag = 1,            // 1 = red, 2 = blue, 4 = green (i.e. << to inc)
+    red = active_color[0],   // R byte
+    green = active_color[1], // G byte
+    blue = active_color[2],  // B byte
+    rgb_byte = red,          // Next color byte to send
+    *ptr = active_flags,     // Next pointer location in flag buffer
+    active = *ptr++,         // Currently loaded flag byte
+    hi = *port |  pinMask,   // Port value to set pin HI
+    lo = *port & ~pinMask,   // Port value to set pin LO
+    next = lo,               // Next port value (HI if color bit sed and LED active)
+    bit = 8,                 // Current color bit (8..0 -> next color or next LED)
+    flag_bit = 8;            // Current flag bit (8..0 -> advance flag pointer)
 
+  // Assembly
   asm volatile (
       // Main loop, repeats every 25 cycles for each bit to send
       "head:"                     "\n\t" // Clk  Pseudocode             (T =  0)
@@ -74,11 +102,11 @@ void update_leds(void) {
         "rjmp .+0"                "\n\t" // 2                           (T = 15)
         "st   %a[port],  %[lo]"   "\n\t" // 1    PORT = lo              (T = 16)
         "rjmp .+0"                "\n\t" // 2                           (T = 18)
-      "rejoin1:"                  "\n\t" //
+      "rejoin1:"                  "\n\t" //                             (T = 18)
         "rjmp .+0"                "\n\t" // 2                           (T = 20)
-      "rejoin2:"                  "\n\t"
+      "rejoin2:"                  "\n\t" //                             (T = 20)
         "nop"                     "\n\t" // 1                           (T = 21)
-      "rejoin3:"                  "\n\t"
+      "rejoin3:"                  "\n\t" //                             (T = 21)
         "rjmp .+0"                "\n\t" // 2                           (T = 23)
         "rjmp head"               "\n\t" // 2    -> head (next bit out)
 

@@ -6,8 +6,9 @@
 #define N_LEDS 60
 #define N_LED_BYTES (N_LEDS/8)
 
+#define MAX_LEDS_ON 8
+
 extern uint8_t active_color[3];
-extern uint8_t active_flags[N_LED_BYTES];
 
 void init_leds(void);
 void clear_led_data(void);
